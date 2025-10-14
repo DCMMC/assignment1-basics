@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
-from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
-from jaxtyping import Float, Int
+from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
 
 
 def run_linear(
@@ -25,7 +24,7 @@ def run_linear(
         out_dim (int): The size of the output dimension
         weights (Float[Tensor, "d_out d_in"]): The linear weights to use
         in_features (Float[Tensor, "... d_in"]): The output tensor to apply the function to
-    
+
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
@@ -47,7 +46,7 @@ def run_embedding(
         d_model (int): The size of the embedding dimension
         weights (Float[Tensor, "vocab_size d_model"]): The embedding vectors to fetch from
         token_ids (Int[Tensor, "..."]): The set of token ids to fetch from the Embedding layer
-    
+
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
@@ -91,7 +90,7 @@ def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys d_k"],
     V: Float[Tensor, " ... values d_v"],
-    mask: Float[Tensor, " ... queries keys"] | None = None,
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
     Given key (K), query (Q), and value (V) tensors, return
@@ -101,7 +100,7 @@ def run_scaled_dot_product_attention(
         Q (Float[Tensor, " ... queries d_k"]): Query tensor
         K (Float[Tensor, " ... keys d_k"]): Key tensor
         V (Float[Tensor, " ... values d_v"]): Values tensor
-        mask (Float[Tensor, " ... queries keys"] | None): Mask tensor
+        mask (Bool[Tensor, " ... queries keys"] | None): Mask tensor
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
@@ -302,7 +301,7 @@ def run_transformer_lm(
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
         rope_theta (float): The RoPE $\Theta$ parameter.
-        weights (dict[str, Tensor]): 
+        weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
             The keys of this dictionary are:
@@ -435,7 +434,9 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     raise NotImplementedError
 
 
-def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
+def run_cross_entropy(
+    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
 
@@ -463,7 +464,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
     raise NotImplementedError
 
 
-def get_adamw_cls() -> type[torch.optim.Optimizer]:
+def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
@@ -521,7 +522,7 @@ def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-):
+) -> int:
     """
     Given a serialized checkpoint (path or file-like object), restore the
     serialized state to the given model and optimizer.
