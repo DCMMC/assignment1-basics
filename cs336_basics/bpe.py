@@ -9,6 +9,13 @@ import re
 import onigurumacffi
 from typing import BinaryIO
 
+try:
+    from bpe_rs import find_merges as _find_merges_rust_impl
+    def find_merges_rust(freq_table: Counter, num_merges: int):
+        return _find_merges_rust_impl(dict(freq_table), num_merges)
+except ImportError:
+    find_merges_rust = None
+
 # GPT-2 pre-tokenizer pattern
 PRE_TOKENIZER_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -72,10 +79,10 @@ def train_bpe(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Train a BPE tokenizer on the input corpus.
-    find_merges_fn: optional (freq_table, num_merges) -> merges; default is find_merges.
+    find_merges_fn: optional (freq_table, num_merges) -> merges; default is find_merges_rust when bpe_rs is installed, else find_merges (V3).
     """
     if find_merges_fn is None:
-        find_merges_fn = find_merges
+        find_merges_fn = find_merges_rust if find_merges_rust is not None else find_merges
     # initialize the vocab with the special tokens
     vocab: dict[int, bytes] = {i : token.encode("utf-8") for i, token in enumerate(special_tokens)}
     vocab.update({i + len(special_tokens) : bytes([i]) for i in range(256)})

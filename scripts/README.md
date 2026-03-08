@@ -1,6 +1,26 @@
-# Benchmark find_merges with Scalene
+# Benchmark and profile find_merges
 
-Compare bottlenecks of the three `find_merges` implementations using [Scalene](https://github.com/plasma-umass/scalene).
+## V3 vs Rust (wall-clock + Rust internal profile)
+
+From project root:
+
+```bash
+uv run python scripts/benchmark_find_merges_v3_vs_rust.py
+```
+
+Rust is typically ~15x faster. To see where time is spent inside Rust:
+
+```bash
+BPE_RS_PROFILE=1 uv run python scripts/benchmark_find_merges_v3_vs_rust.py
+```
+
+For native profiling (py-spy / flamegraph), see `bpe_rs/README.md`.
+
+---
+
+## Scalene: Python implementations
+
+Compare bottlenecks of the three Python `find_merges` implementations (and Rust when installed) using [Scalene](https://github.com/plasma-umass/scalene).
 
 Install Scalene (if needed):
 
@@ -14,6 +34,7 @@ From the **project root** run (one per version):
 uv run scalene run --outfile profile_original.json scripts/benchmark_find_merges_scalene.py original
 uv run scalene run --outfile profile_linked_list.json scripts/benchmark_find_merges_scalene.py linked_list
 uv run scalene run --outfile profile_incremental.json scripts/benchmark_find_merges_scalene.py incremental
+uv run scalene run --outfile profile_rust.json scripts/benchmark_find_merges_scalene.py rust   # if bpe_rs installed
 ```
 
 Then open the generated `profile_*.html` files in a browser to compare:

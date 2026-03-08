@@ -76,6 +76,30 @@ def test_find_merges_example():
     assert merges == expected_first_6
 
 
+def test_find_merges_rust_example():
+    """When bpe_rs is installed, Rust find_merges must match Python on the same example."""
+    from cs336_basics.bpe import find_merges_rust
+    import pytest
+    if find_merges_rust is None:
+        pytest.skip("bpe_rs not installed (build with: cd bpe_rs && maturin develop --release)")
+    freq_table = Counter({
+        b"low": 5,
+        b"lower": 2,
+        b"widest": 3,
+        b"newest": 6,
+    })
+    merges = find_merges_rust(freq_table, 6)
+    expected_first_6 = [
+        (b"s", b"t"),
+        (b"e", b"st"),
+        (b"o", b"w"),
+        (b"l", b"ow"),
+        (b"w", b"est"),
+        (b"n", b"e"),
+    ]
+    assert merges == expected_first_6
+
+
 def test_train_bpe_speed():
     """
     Ensure that BPE training is relatively efficient by measuring training
@@ -98,15 +122,17 @@ def test_train_bpe_speed():
 
 def test_find_merges_speed_compare():
     """
-    Compare performance of the three find_merges implementations using the same
-    setup as test_train_bpe_speed (corpus.en, vocab_size=500). All three must
-    produce the same merges; the default (optimization 2) must stay under 1.5s.
+    Compare performance of the three find_merges implementations (and Rust when
+    available) using the same setup as test_train_bpe_speed (corpus.en,
+    vocab_size=500). All must produce the same merges; the default (V3) must
+    stay under 1.5s.
     """
     from cs336_basics.bpe import (
         train_bpe,
         find_merges_original,
         find_merges_linked_list,
         find_merges,
+        find_merges_rust,
     )
     input_path = FIXTURES_PATH / "corpus.en"
     vocab_size = 500
@@ -116,6 +142,8 @@ def test_find_merges_speed_compare():
         ("optimization 1 (linked list)", find_merges_linked_list),
         ("optimization 2 (incremental)", find_merges),
     ]
+    if find_merges_rust is not None:
+        versions.append(("Rust (bpe_rs)", find_merges_rust))
     results = []
     for name, find_merges_fn in versions:
         start = time.time()

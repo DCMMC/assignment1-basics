@@ -25,16 +25,24 @@ from cs336_basics.bpe import (
     find_merges,
 )
 
+try:
+    from cs336_basics.bpe import find_merges_rust
+except ImportError:
+    find_merges_rust = None
+
 VERSIONS = {
     "original": find_merges_original,
     "linked_list": find_merges_linked_list,
     "incremental": find_merges,
 }
+if find_merges_rust is not None:
+    VERSIONS["rust"] = find_merges_rust
 
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in VERSIONS:
-        print(f"Usage: {sys.argv[0]} {{original|linked_list|incremental}}", file=sys.stderr)
+        opts = "|".join(VERSIONS.keys())
+        print(f"Usage: {sys.argv[0]} {{{opts}}}", file=sys.stderr)
         sys.exit(1)
     name = sys.argv[1]
     find_merges_fn = VERSIONS[name]
