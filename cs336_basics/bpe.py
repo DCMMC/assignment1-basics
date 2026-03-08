@@ -1,3 +1,7 @@
+# ----------------------------------------------------------
+# BPE implementation @ CS336 Assignment 1
+# @author: Wentao XIAO <xwt97294597@gmail.com>
+# ----------------------------------------------------------
 from collections import Counter
 from multiprocessing import Pool
 import os
@@ -95,6 +99,7 @@ def pre_tokenize_file(input_path: str | os.PathLike, desired_num_chunks: int = 1
             f, desired_num_chunks,
             special_tokens[0].encode("utf-8") if special_tokens else b"<|endoftext|>",
         )
+        # Optimization 0: Use multiprocessing only for large files
         if os.path.getsize(input_path) < 1024 * 1024:
             # Small file: run in main process to avoid multiprocessing overhead
             init_worker(input_path, PRE_TOKENIZER_PATTERN, special_tokens)
@@ -361,5 +366,4 @@ def find_merges(freq_table: Counter, num_merges: int) -> list[tuple[bytes, bytes
                 else:
                     prev = node
                     node = node.next
-
     return merges
