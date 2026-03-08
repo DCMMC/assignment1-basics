@@ -160,4 +160,7 @@ cython_debug/
 #.idea/
 
 .ruff_cache/
-*.zip
+*.zipdata
+data/
+.python-version
+.vscode/

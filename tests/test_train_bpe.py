@@ -1,8 +1,79 @@
 import json
 import time
 
+from collections import Counter
+
 from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
+
+
+def test_pre_tokenize_file(tmp_path):
+    """
+    pre_tokenize_file counts token frequencies. Tokens may include leading space
+    from the pre-tokenizer pattern; we normalize by stripping leading space for comparison.
+    """
+    from cs336_basics.bpe import pre_tokenize_file
+
+    text = (
+        "low low low low low\n"
+        "lower lower widest widest widest\n"
+        "newest newest newest newest newest newest\n"
+        "<|endoftext|>"
+        "low low low low low\n"
+        "lower lower widest widest widest\n"
+        "newest newest newest newest newest newest\n"
+        "<|endoftext|>"
+    )
+    corpus_file = tmp_path / "corpus.txt"
+    corpus_file.write_text(text)
+
+    freq_table = pre_tokenize_file(
+        corpus_file,
+        desired_num_chunks=1,
+        special_tokens=["<|endoftext|>"],
+    )
+
+    # Normalize: GPT-2 pattern may produce " word" (leading space), count as "word"
+    normalized = Counter()
+    for token_bytes, count in freq_table.items():
+        key = token_bytes.lstrip(b" ")
+        if key:
+            normalized[key] += count
+
+    expected = {
+        b"\n": 6,
+        b"low": 10,
+        b"lower": 4,
+        b"widest": 6,
+        b"newest": 12,
+    }
+    assert dict(normalized) == expected
+
+
+def test_find_merges_example():
+    """
+    Example from the spec: low(5), lower(2), widest(3), newest(6).
+    First round pair counts: lo:7, ow:7, we:8, er:2, wi:3, id:3, de:3, es:9, st:9, ne:6, ew:6.
+    Tie (es, st) -> take lexicographically greater (st). First 6 merges: s t, e st, o w, l ow, w est, n e.
+    """
+    from cs336_basics.bpe import find_merges
+
+    freq_table = Counter({
+        b"low": 5,
+        b"lower": 2,
+        b"widest": 3,
+        b"newest": 6,
+    })
+    merges = find_merges(freq_table, num_merges=6)
+    expected_first_6 = [
+        (b"s", b"t"),
+        (b"e", b"st"),
+        (b"o", b"w"),
+        (b"l", b"ow"),
+        (b"w", b"est"),
+        (b"n", b"e"),
+    ]
+    assert merges == expected_first_6
 
 
 def test_train_bpe_speed():
@@ -21,7 +92,47 @@ def test_train_bpe_speed():
         special_tokens=["<|endoftext|>"],
     )
     end_time = time.time()
-    assert end_time - start_time < 1.5
+    cost = end_time - start_time
+    assert cost < 1.5
+
+
+def test_find_merges_speed_compare():
+    """
+    Compare performance of the three find_merges implementations using the same
+    setup as test_train_bpe_speed (corpus.en, vocab_size=500). All three must
+    produce the same merges; the default (optimization 2) must stay under 1.5s.
+    """
+    from cs336_basics.bpe import (
+        train_bpe,
+        find_merges_original,
+        find_merges_linked_list,
+        find_merges,
+    )
+    input_path = FIXTURES_PATH / "corpus.en"
+    vocab_size = 500
+    special_tokens = ["<|endoftext|>"]
+    versions = [
+        ("original", find_merges_original),
+        ("optimization 1 (linked list)", find_merges_linked_list),
+        ("optimization 2 (incremental)", find_merges),
+    ]
+    results = []
+    for name, find_merges_fn in versions:
+        start = time.time()
+        vocab, merges = train_bpe(
+            input_path=input_path,
+            vocab_size=vocab_size,
+            special_tokens=special_tokens,
+            find_merges_fn=find_merges_fn,
+        )
+        elapsed = time.time() - start
+        results.append((name, merges, elapsed))
+    ref_merges = results[0][1]
+    for name, merges, elapsed in results:
+        assert merges == ref_merges, f"{name} produced different merges"
+    assert results[2][2] < 1.5, f"optimization 2 took {results[2][2]:.2f}s (limit 1.5s)"
+    for name, _, elapsed in results:
+        print(f"  find_merges: {name}: {elapsed:.3f}s")
 
 
 def test_train_bpe():
