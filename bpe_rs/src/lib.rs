@@ -261,6 +261,7 @@ fn apply_bpe_encode_batch(
     }
 
     let mut result: Vec<Vec<u32>> = Vec::with_capacity(words.len());
+    // NOTE(perf): multi-threading this loop would be faster for large batches
     for word_any in words.iter() {
         let word_list = word_any.downcast::<pyo3::types::PyList>()?;
         let mut token_ids: Vec<TokenId> = Vec::with_capacity(word_list.len());

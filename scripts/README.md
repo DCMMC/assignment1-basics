@@ -1,5 +1,27 @@
 # Benchmark and profile find_merges
 
+
+## cProfile
+
+```bash
+uv run python -c "
+import cProfile
+import pstats
+from io import StringIO
+from cs336_basics.bpe import train_bpe
+from tests.common import FIXTURES_PATH
+
+pr = cProfile.Profile()
+pr.enable()
+train_bpe(FIXTURES_PATH / 'corpus.en', vocab_size=500, special_tokens=['<|endoftext|>'], desired_num_chunks=100)
+pr.disable()
+s = StringIO()
+ps = pstats.Stats(pr, stream=s).sort_stats(pstats.SortKey.CUMULATIVE)
+ps.print_stats(25)
+print(s.getvalue())
+"
+```
+
 ## V3 vs Rust (wall-clock + Rust internal profile)
 
 From project root:
