@@ -4,8 +4,13 @@
 # ----------------------------------------------------------
 from collections import Counter
 from multiprocessing import Pool
+from pathlib import Path
+import argparse
+import json
 import os
 import re
+import resource
+import time
 import onigurumacffi
 from typing import BinaryIO
 
@@ -374,3 +379,204 @@ def find_merges(freq_table: Counter, num_merges: int) -> list[tuple[bytes, bytes
                     prev = node
                     node = node.next
     return merges
+
+
+def gpt2_bytes_to_unicode() -> dict[int, str]:
+    """
+    Returns a mapping between every possible byte (an integer from 0 to 255) to a
+    printable unicode string character representation.
+    This is adapted from the GPT-2 code and duplicated here so that we can
+    serialize BPE vocabularies and merges in a human-readable format without
+    depending on the test utilities.
+    """
+    # These 188 integers can used as-is, since they are not whitespace or control characters.
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(
+        range(ord("®"), ord("ÿ") + 1)
+    )
+    cs = bs[:]
+    # now get the representations of the other 68 integers that do need shifting
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            # If this integer isn't in our list of visually-representable
+            # characters, then map it to the next nice character (offset by 256)
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    characters = [chr(n) for n in cs]
+    d = dict(zip(bs, characters))
+    return d
+
+
+def _bytes_to_gpt2_token(token_bytes: bytes, byte_encoder: dict[int, str]) -> str:
+    """Convert a sequence of bytes into the printable GPT-2 unicode representation."""
+    return "".join(byte_encoder[b] for b in token_bytes)
+
+
+def _serialize_vocab_and_merges(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    out_prefix: Path,
+) -> tuple[Path, Path, int, str]:
+    """
+    Serialize vocab and merges in a GPT-2-compatible, human-readable format.
+
+    Returns:
+        vocab_path, merges_path, longest_token_id, longest_token_repr
+    """
+    byte_encoder = gpt2_bytes_to_unicode()
+
+    # Invert vocab to GPT-2-style encoder.json: token_string -> token_id
+    encoder: dict[str, int] = {}
+    for token_id, token_bytes in vocab.items():
+        token_str = _bytes_to_gpt2_token(token_bytes, byte_encoder)
+        encoder[token_str] = token_id
+
+    vocab_path = out_prefix.with_suffix(".vocab.json")
+    merges_path = out_prefix.with_suffix(".merges.txt")
+
+    vocab_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with vocab_path.open("w", encoding="utf-8") as f:
+        json.dump(encoder, f, ensure_ascii=False, indent=2)
+
+    with merges_path.open("w", encoding="utf-8") as f:
+        for left, right in merges:
+            left_str = _bytes_to_gpt2_token(left, byte_encoder)
+            right_str = _bytes_to_gpt2_token(right, byte_encoder)
+            f.write(f"{left_str} {right_str}\n")
+
+    # Find the longest token in terms of underlying byte length
+    longest_token_id, longest_token_bytes = max(
+        vocab.items(), key=lambda kv: len(kv[1])
+    )
+    longest_token_repr = _bytes_to_gpt2_token(longest_token_bytes, byte_encoder)
+
+    return vocab_path, merges_path, longest_token_id, longest_token_repr
+
+
+def _run_experiment(
+    name: str,
+    input_path: Path,
+    vocab_size: int,
+    special_tokens: list[str],
+    out_prefix: Path,
+) -> None:
+    """
+    Train BPE on the given corpus, serialize vocab/merges, and report time, memory, and longest token.
+    """
+    print(f"Running experiment '{name}'")
+    print(f"  Input path   : {input_path}")
+    print(f"  Vocab size   : {vocab_size}")
+    print(f"  Special tokens: {special_tokens}")
+
+    start_time = time.time()
+    vocab, merges = train_bpe(
+        input_path=str(input_path),
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+    )
+    end_time = time.time()
+    elapsed_seconds = end_time - start_time
+    elapsed_hours = elapsed_seconds / 3600.0
+
+    # Peak memory usage (best-effort; units are platform-dependent but typically kilobytes on Unix).
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        max_rss_kb = usage.ru_maxrss
+        max_rss_gb = max_rss_kb / (1024**2)
+    except Exception:
+        max_rss_kb = None
+        max_rss_gb = None
+
+    vocab_path, merges_path, longest_token_id, longest_token_repr = _serialize_vocab_and_merges(
+        vocab, merges, out_prefix
+    )
+
+    longest_token_bytes = vocab[longest_token_id]
+
+    print("\n=== Training summary ===")
+    print(f"Experiment    : {name}")
+    print(f"Elapsed time  : {elapsed_seconds:.2f} seconds (~{elapsed_hours:.2f} hours)")
+    if max_rss_kb is not None:
+        print(f"Peak RSS      : {max_rss_kb} KB (~{max_rss_gb:.3f} GB)")
+    else:
+        print("Peak RSS      : <unavailable on this platform>")
+    print(f"Vocab path    : {vocab_path}")
+    print(f"Merges path   : {merges_path}")
+    print(f"Vocab size    : {len(vocab)}")
+    print(f"Num merges    : {len(merges)}")
+    print(
+        f"Longest token : id={longest_token_id}, byte_length={len(longest_token_bytes)}, "
+        f"token={repr(longest_token_repr)}"
+    )
+    print("========================\n")
+
+
+if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parent.parent
+    data_dir = project_root / "data"
+
+    parser = argparse.ArgumentParser(
+        description="BPE utilities for CS336 Assignment 1.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Train on TinyStories
+    tinystories_parser = subparsers.add_parser(
+        "train_bpe_tinystories",
+        help="Train a BPE tokenizer on the TinyStories training corpus.",
+    )
+    tinystories_parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=10000,
+        help="Total vocabulary size (including special tokens). Default: 10000.",
+    )
+    tinystories_parser.add_argument(
+        "--special-tokens",
+        nargs="*",
+        default=["<|endoftext|>"],
+        help="Special tokens to prepend to the vocabulary. Default: <|endoftext|>.",
+    )
+
+    # Train on OpenWebText sample (expts_owt)
+    owt_parser = subparsers.add_parser(
+        "train_bpe_expts_owt",
+        help="Train a BPE tokenizer on the OpenWebText (expts_owt) training corpus.",
+    )
+    owt_parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=32000,
+        help="Total vocabulary size (including special tokens). Default: 32000.",
+    )
+    owt_parser.add_argument(
+        "--special-tokens",
+        nargs="*",
+        default=["<|endoftext|>"],
+        help="Special tokens to prepend to the vocabulary. Default: <|endoftext|>.",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "train_bpe_tinystories":
+        input_path = data_dir / "TinyStoriesV2-GPT4-train.txt"
+        out_prefix = data_dir / "tinystories_bpe"
+        _run_experiment(
+            name="TinyStories",
+            input_path=input_path,
+            vocab_size=args.vocab_size,
+            special_tokens=args.special_tokens,
+            out_prefix=out_prefix,
+        )
+    elif args.command == "train_bpe_expts_owt":
+        input_path = data_dir / "owt_train.txt"
+        out_prefix = data_dir / "expts_owt_bpe"
+        _run_experiment(
+            name="expts_owt",
+            input_path=input_path,
+            vocab_size=args.vocab_size,
+            special_tokens=args.special_tokens,
+            out_prefix=out_prefix,
+        )
