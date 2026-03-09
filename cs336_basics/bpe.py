@@ -14,6 +14,7 @@ import resource
 import time
 import onigurumacffi
 from typing import BinaryIO, Iterable, Self
+from tests.common import gpt2_bytes_to_unicode
 
 try:
     from bpe_rs import apply_bpe_encode_batch as _apply_bpe_encode_batch_rust
@@ -608,33 +609,6 @@ class Tokenizer:
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
         return chain.from_iterable(self.encode(text) for text in iterable)
-
-
-def gpt2_bytes_to_unicode() -> dict[int, str]:
-    """
-    Returns a mapping between every possible byte (an integer from 0 to 255) to a
-    printable unicode string character representation.
-    This is adapted from the GPT-2 code and duplicated here so that we can
-    serialize BPE vocabularies and merges in a human-readable format without
-    depending on the test utilities.
-    """
-    # These 188 integers can used as-is, since they are not whitespace or control characters.
-    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(
-        range(ord("®"), ord("ÿ") + 1)
-    )
-    cs = bs[:]
-    # now get the representations of the other 68 integers that do need shifting
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            # If this integer isn't in our list of visually-representable
-            # characters, then map it to the next nice character (offset by 256)
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    characters = [chr(n) for n in cs]
-    d = dict(zip(bs, characters))
-    return d
 
 
 def _bytes_to_gpt2_token(token_bytes: bytes, byte_encoder: dict[int, str]) -> str:
