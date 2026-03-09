@@ -3,6 +3,7 @@
 # @author: Wentao XIAO <xwt97294597@gmail.com>
 # ----------------------------------------------------------
 from collections import Counter
+from itertools import chain
 from multiprocessing import Pool
 from pathlib import Path
 import argparse
@@ -12,13 +13,16 @@ import re
 import resource
 import time
 import onigurumacffi
-from typing import BinaryIO
+from typing import BinaryIO, Iterable, Self
 
 try:
+    from bpe_rs import apply_bpe_encode_batch as _apply_bpe_encode_batch_rust
     from bpe_rs import find_merges as _find_merges_rust_impl
+
     def find_merges_rust(freq_table: Counter, num_merges: int):
         return _find_merges_rust_impl(dict(freq_table), num_merges)
 except ImportError:
+    _apply_bpe_encode_batch_rust = None
     find_merges_rust = None
 
 # GPT-2 pre-tokenizer pattern
@@ -130,7 +134,9 @@ def pre_tokenize_file(input_path: str | os.PathLike, desired_num_chunks: int = 1
     return freq_table
 
 
-def find_iter(regex, chunk, special_tokens_regex, start=0):
+def find_iter(regex: onigurumacffi._Pattern, chunk: bytes,
+    special_tokens_regex: onigurumacffi._Pattern, start: int = 0
+) -> Iterable[onigurumacffi._Match]:
     """
     Find all matches of the regex in the chunk, skipping special tokens.
     NOTE: use the underlying onigurumacffi API to avoid calling encode() and decode()
@@ -170,6 +176,48 @@ def find_iter(regex, chunk, special_tokens_regex, start=0):
         pos = spec_match._ends[0]
 
 
+def iter_encode_segments(
+    chunk: bytes,
+    regex: onigurumacffi._Pattern,
+    special_tokens_regex: onigurumacffi._Pattern,
+    start: int = 0,
+) -> Iterable[tuple[bytes, bool]]:
+    """
+    Yield (segment_bytes, is_special) in order for encode().
+    Like find_iter but also yields special-token segments as (bytes, True).
+    """
+    region = onigurumacffi._region()
+    pos = start
+    while pos < len(chunk):
+        ret = onigurumacffi._lib.onigcffi_search(
+            special_tokens_regex._regex_t, chunk, len(chunk), pos, region,
+            onigurumacffi.OnigSearchOption.NONE,
+        )
+        spec_match = onigurumacffi._match_ret(ret, chunk, region)
+        if spec_match is None:
+            segment_end = len(chunk)
+        else:
+            segment_end = spec_match._begs[0]
+
+        seg_start = pos
+        while seg_start < segment_end:
+            ret = onigurumacffi._lib.onigcffi_search(
+                regex._regex_t, chunk, segment_end, seg_start, region,
+                onigurumacffi.OnigSearchOption.NONE,
+            )
+            match = onigurumacffi._match_ret(ret, chunk, region)
+            if match:
+                yield (chunk[match._begs[0]:match._ends[0]], False)
+                seg_start = match._ends[0]
+            else:
+                break
+
+        if spec_match is None:
+            break
+        yield (chunk[spec_match._begs[0]:spec_match._ends[0]], True)
+        pos = spec_match._ends[0]
+
+
 # Worker state (set by init_worker for each process); used by pre_tokenize_chunk.
 _worker_file = None
 _worker_regex = None
@@ -202,6 +250,17 @@ class _Node:
 
     def __init__(self, token: bytes, next: "_Node | None" = None) -> None:
         self.token = token
+        self.next = next
+
+
+class _EncodeNode:
+    """Single node of a linked list of token ids (for Rust-style encode merge)."""
+    __slots__ = ("token_id", "next")
+    token_id: int
+    next: "_EncodeNode | None"
+
+    def __init__(self, token_id: int, next: "_EncodeNode | None" = None) -> None:
+        self.token_id = token_id
         self.next = next
 
 
@@ -381,6 +440,176 @@ def find_merges(freq_table: Counter, num_merges: int) -> list[tuple[bytes, bytes
     return merges
 
 
+def _merge_pair_in_ids_in_place(
+    head: "_EncodeNode | None",
+    left_id: int,
+    right_id: int,
+    merged_id: int,
+) -> "_EncodeNode | None":
+    """Merge one pair in a linked list of token ids in place (no extra list alloc)."""
+    node = head
+    while node is not None and node.next is not None:
+        if node.token_id == left_id and node.next.token_id == right_id:
+            node.token_id = merged_id
+            node.next = node.next.next
+        else:
+            node = node.next
+    return head
+
+
+def _apply_merges_to_word_python_style(
+    word_bytes: bytes,
+    encoder: dict[bytes, int],
+    merges_ids: list[tuple[int, int, int]],
+) -> list[int]:
+    """
+    Apply BPE merges using a linked list and in-place merge (Python V3–style),
+    operating purely in id space.
+
+    `merges_ids` contains triples of (left_id, right_id, merged_id).
+    """
+    if not word_bytes:
+        return []
+    # Build initial linked list of token ids (one node per input byte)
+    head: _EncodeNode | None = None
+    for b in reversed(word_bytes):
+        head = _EncodeNode(encoder[bytes([b])], head)
+    # Apply each merge in id space
+    for left_id, right_id, merged_id in merges_ids:
+        head = _merge_pair_in_ids_in_place(head, left_id, right_id, merged_id)
+    # Collect back to a Python list of ids
+    out: list[int] = []
+    while head is not None:
+        out.append(head.token_id)
+        head = head.next
+    return out
+
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None
+    ) -> None:
+        self.vocab = vocab
+        self.merges = merges
+        self._encoder: dict[bytes, int] = {v: k for k, v in vocab.items()}
+        # Precompute merges in id space: (left_id, right_id, merged_id)
+        merges_ids: list[tuple[int, int, int]] = []
+        for left, right in merges:
+            try:
+                left_id = self._encoder[left]
+                right_id = self._encoder[right]
+                merged_id = self._encoder[left + right]
+            except KeyError:
+                # Skip any merge that doesn't have a corresponding token in vocab
+                continue
+            merges_ids.append((left_id, right_id, merged_id))
+        self._merges_ids = merges_ids
+        if special_tokens is None:
+            special_tokens = []
+        self.special_tokens = [token.encode("utf-8") for token in special_tokens]
+        # Match longest special token first so overlapping tokens
+        # (e.g. "<|endoftext|><|endoftext|>") are one token
+        special_ordered = sorted(special_tokens, key=len, reverse=True)
+        self.special_tokens_regex = onigurumacffi.compile(
+            "|".join(re.escape(t) for t in special_ordered) or r"(?!)"
+        )
+        self.regex = onigurumacffi.compile(PRE_TOKENIZER_PATTERN)
+
+    def encode(
+        self,
+        text: str,
+        *,
+        use_rust_style: bool = True,
+    ) -> list[int]:
+        """
+        Encode text to token ids. Segments from pre-tokenizer (regex + special tokens)
+        are processed in order; each normal word is BPE-merged.
+
+        use_rust_style=True:  Rust batch (bpe_rs.apply_bpe_encode_batch) if available, else Python linked list.
+        use_rust_style=False: Python linked list + in-place merge.
+        """
+        chunk = text.encode("utf-8")
+        use_rust = use_rust_style and _apply_bpe_encode_batch_rust is not None
+
+        # We batch consecutive normal segments so that the Rust path can process
+        # many words in a single call, and the Python path can also amortize overhead.
+        result: list[int] = []
+        pending_words: list[bytes] = []
+
+        def flush_pending() -> None:
+            nonlocal pending_words, result
+            if not pending_words:
+                return
+            if use_rust and _apply_bpe_encode_batch_rust is not None:
+                # Batch path: convert each word's bytes into initial byte-level ids
+                words_ids: list[list[int]] = [
+                    [self._encoder[bytes([b])] for b in word_bytes]
+                    for word_bytes in pending_words
+                ]
+                encoded_batch = _apply_bpe_encode_batch_rust(
+                    words_ids, self._merges_ids
+                )
+                for word_ids in encoded_batch:
+                    result.extend(word_ids)
+            else:
+                # Pure Python path using linked-list merges in id space
+                for word_bytes in pending_words:
+                    result.extend(
+                        _apply_merges_to_word_python_style(
+                            word_bytes, self._encoder, self._merges_ids
+                        )
+                    )
+            pending_words = []
+
+        for segment_bytes, is_special in iter_encode_segments(
+            chunk, self.regex, self.special_tokens_regex
+        ):
+            if is_special:
+                flush_pending()
+                result.append(self._encoder[segment_bytes])
+            else:
+                pending_words.append(segment_bytes)
+
+        flush_pending()
+        return result
+
+    def decode(self, ids: list[int] | list[list[int]]) -> str:
+        # Decode the concatenated token bytes as UTF-8 so multi-byte sequences (e.g. emoji) decode correctly.
+        # Replace malformed bytes with the official Unicode replacement character (U+FFFD).
+        if ids and isinstance(ids[0], list):
+            ids = [tid for row in ids for tid in row]
+        return b"".join(self.vocab[tid] for tid in ids).decode("utf-8", errors="replace")
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str | os.PathLike,
+        merges_filepath: str | os.PathLike,
+        special_tokens: list[str] | None = None
+    ) -> Self:
+        byte_encoder = gpt2_bytes_to_unicode()
+        byte_decoder = {c: b for b, c in byte_encoder.items()}
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            encoder = json.load(f)
+        vocab: dict[int, bytes] = {
+            token_id: _gpt2_token_to_bytes(token_str, byte_decoder)
+            for token_str, token_id in encoder.items()
+        }
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                left_str, right_str = line.split(" ", 1)
+                merges.append((
+                    _gpt2_token_to_bytes(left_str, byte_decoder),
+                    _gpt2_token_to_bytes(right_str, byte_decoder),
+                ))
+        return cls(vocab, merges, special_tokens)
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        return chain.from_iterable(self.encode(text) for text in iterable)
+
+
 def gpt2_bytes_to_unicode() -> dict[int, str]:
     """
     Returns a mapping between every possible byte (an integer from 0 to 255) to a
@@ -411,6 +640,11 @@ def gpt2_bytes_to_unicode() -> dict[int, str]:
 def _bytes_to_gpt2_token(token_bytes: bytes, byte_encoder: dict[int, str]) -> str:
     """Convert a sequence of bytes into the printable GPT-2 unicode representation."""
     return "".join(byte_encoder[b] for b in token_bytes)
+
+
+def _gpt2_token_to_bytes(token_str: str, byte_decoder: dict[str, int]) -> bytes:
+    """Convert GPT-2 unicode token representation back to bytes."""
+    return bytes(byte_decoder[c] for c in token_str)
 
 
 def _serialize_vocab_and_merges(
@@ -513,6 +747,85 @@ def _run_experiment(
     print("========================\n")
 
 
+def _run_encode_profile() -> None:
+    """Profile tokenizer encode: compare Rust batch vs Python and print bottlenecks."""
+    import cProfile
+    import pstats
+
+    project_root = Path(__file__).resolve().parent.parent
+    fixtures = project_root / "tests" / "fixtures"
+    vocab_path = fixtures / "gpt2_vocab.json"
+    merges_path = fixtures / "gpt2_merges.txt"
+    if not vocab_path.exists() or not merges_path.exists():
+        print("Profile requires tests/fixtures/gpt2_vocab.json and gpt2_merges.txt")
+        return
+    tokenizer = Tokenizer.from_files(
+        vocab_path, merges_path, special_tokens=["<|endoftext|>"]
+    )
+    sample_path = fixtures / "tinystories_sample.txt"
+    if sample_path.exists():
+        full = sample_path.read_text(encoding="utf-8")
+        text = full[: max(1, len(full) // 8)]
+    else:
+        fallback = "The quick brown fox jumps over the lazy dog. " * 200
+        text = fallback[: len(fallback) // 8]
+
+    n_runs = 5
+    use_rust = _apply_bpe_encode_batch_rust is not None
+
+    # --- Timing: Python ---
+    print("\n=== Rust (batch) vs Python (sample size 1/8, {} runs) ===\n".format(n_runs))
+    t0 = time.perf_counter()
+    for _ in range(n_runs):
+        tokenizer.encode(text, use_rust_style=False)
+    t_py = time.perf_counter() - t0
+    print("Python: {:.4f}s total  ({:.4f}s per run)".format(t_py, t_py / n_runs))
+
+    # --- Timing: Rust batch ---
+    if use_rust:
+        t0 = time.perf_counter()
+        for _ in range(n_runs):
+            tokenizer.encode(text, use_rust_style=True)
+        t_rust_batch = time.perf_counter() - t0
+        print(
+            "Rust (batch):     {:.4f}s total  ({:.4f}s per run)".format(
+                t_rust_batch, t_rust_batch / n_runs
+            )
+        )
+        if t_rust_batch > 0:
+            print(
+                "  Speedup (Python / Rust batch): {:.2f}x\n".format(
+                    t_py / t_rust_batch
+                )
+            )
+    else:
+        t_rust_batch = None
+        print("Rust batch encode: not available (bpe_rs not installed)")
+
+    # --- cProfile: Python implementation ---
+    prof_py = cProfile.Profile()
+    prof_py.enable()
+    for _ in range(n_runs):
+        tokenizer.encode(text, use_rust_style=False)
+    prof_py.disable()
+    stats_py = pstats.Stats(prof_py)
+    stats_py.sort_stats(pstats.SortKey.CUMULATIVE)
+    print("=== Python implementation (top 20 cumulative) ===\n")
+    stats_py.print_stats(20)
+
+    if use_rust:
+        # --- cProfile: Rust implementation (overhead is in iter_encode_segments + Rust call) ---
+        prof_rust = cProfile.Profile()
+        prof_rust.enable()
+        for _ in range(n_runs):
+            tokenizer.encode(text, use_rust_style=True)
+        prof_rust.disable()
+        stats_rust = pstats.Stats(prof_rust)
+        stats_rust.sort_stats(pstats.SortKey.CUMULATIVE)
+        print("=== Rust implementation (top 20 cumulative) ===\n")
+        stats_rust.print_stats(20)
+
+
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent.parent
     data_dir = project_root / "data"
@@ -521,6 +834,11 @@ if __name__ == "__main__":
         description="BPE utilities for CS336 Assignment 1.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    profile_parser = subparsers.add_parser(
+        "profile",
+        help="Profile tokenizer encode and print bottlenecks.",
+    )
 
     # Train on TinyStories
     tinystories_parser = subparsers.add_parser(
@@ -560,7 +878,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.command == "train_bpe_tinystories":
+    if args.command == "profile":
+        _run_encode_profile()
+    elif args.command == "train_bpe_tinystories":
         input_path = data_dir / "TinyStoriesV2-GPT4-train.txt"
         out_prefix = data_dir / "tinystories_bpe"
         _run_experiment(

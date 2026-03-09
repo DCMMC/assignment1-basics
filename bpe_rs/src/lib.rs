@@ -192,8 +192,91 @@ fn py_freq_table_to_rust(
     Ok(out)
 }
 
+/// Internal helper: encode a single word given token ids and prepared merges_ids.
+fn encode_word_ids(
+    token_ids: &[TokenId],
+    merges_vec: &[(TokenId, TokenId, TokenId)],
+) -> Vec<TokenId> {
+    if token_ids.is_empty() {
+        return Vec::new();
+    }
+
+    /// Linked-list node over token ids
+    #[derive(Clone, Copy)]
+    struct EncodeNode {
+        token_id: TokenId,
+        next: Option<usize>,
+    }
+    let mut arena: Vec<EncodeNode> = Vec::with_capacity(token_ids.len());
+    let mut head: Option<usize> = None;
+    for &tid in token_ids.iter().rev() {
+        let idx = arena.len();
+        arena.push(EncodeNode {
+            token_id: tid,
+            next: head,
+        });
+        head = Some(idx);
+    }
+
+    for &(left_id, right_id, merged_id) in merges_vec {
+        let mut idx = head;
+        while let Some(i) = idx {
+            let next_idx = arena[i].next;
+            if let Some(j) = next_idx {
+                if arena[i].token_id == left_id && arena[j].token_id == right_id {
+                    arena[i].token_id = merged_id;
+                    arena[i].next = arena[j].next;
+                    idx = arena[i].next;
+                    continue;
+                }
+            }
+            idx = next_idx;
+        }
+    }
+    let mut out: Vec<TokenId> = Vec::with_capacity(token_ids.len());
+    let mut idx = head;
+    while let Some(i) = idx {
+        out.push(arena[i].token_id);
+        idx = arena[i].next;
+    }
+    out
+}
+
+/// Encode a batch of words (each a list of token ids) in one Rust call.
+#[pyfunction]
+fn apply_bpe_encode_batch(
+    _py: Python<'_>,
+    words: &Bound<'_, pyo3::types::PyList>,
+    merges_ids: &Bound<'_, pyo3::types::PyList>,
+) -> PyResult<Vec<Vec<u32>>> {
+    // Prepare merges once per batch
+    let mut merges_vec: Vec<(TokenId, TokenId, TokenId)> =
+        Vec::with_capacity(merges_ids.len());
+    for item in merges_ids.iter() {
+        let pair = item.downcast::<pyo3::types::PyTuple>()?;
+        let left_id: u32 = pair.get_item(0)?.extract()?;
+        let right_id: u32 = pair.get_item(1)?.extract()?;
+        let merged_id: u32 = pair.get_item(2)?.extract()?;
+        merges_vec.push((left_id, right_id, merged_id));
+    }
+
+    let mut result: Vec<Vec<u32>> = Vec::with_capacity(words.len());
+    for word_any in words.iter() {
+        let word_list = word_any.downcast::<pyo3::types::PyList>()?;
+        let mut token_ids: Vec<TokenId> = Vec::with_capacity(word_list.len());
+        for item in word_list.iter() {
+            let id: u32 = item.extract()?;
+            token_ids.push(id);
+        }
+        let out_ids = encode_word_ids(&token_ids, &merges_vec);
+        result.push(out_ids);
+    }
+    Ok(result)
+}
+
 #[pymodule]
 fn bpe_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_merges, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_bpe_encode_batch, m)?)?;
     Ok(())
 }
