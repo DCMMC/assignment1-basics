@@ -23,7 +23,7 @@ class Linear(nn.Module):
         linear_weight_init(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return dot("... d_in, d_out d_in -> ... d_out", x, self.weight)
+        return dot("... [d_in], d_out [d_in] -> ... d_out", x, self.weight)
 
 
 class Embedding(nn.Module):
@@ -63,14 +63,14 @@ def silu(x: torch.Tensor) -> torch.Tensor:
 def glu(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
     activation: Callable[[torch.Tensor], torch.Tensor] = torch.sigmoid
 ) -> torch.Tensor:
-    act = activation(dot("... d_model, d_ff d_model -> ... d_ff", x, w1))
-    return act * dot("... d_model, d_ff d_model -> ... d_ff", x, w2)
+    act = activation(dot("... [d_model], d_ff [d_model] -> ... d_ff", x, w1))
+    return act * dot("... [d_model], d_ff [d_model] -> ... d_ff", x, w2)
 
 
 def swiglu(x: torch.Tensor, w1_weight: torch.Tensor, w2_weight: torch.Tensor,
     w3_weight: torch.Tensor
 ) -> torch.Tensor:
-    return dot("... d_ff, d_model d_ff -> ... d_model", glu(x, w1_weight, w3_weight, silu), w2_weight)
+    return dot("... [d_ff], d_model [d_ff] -> ... d_model", glu(x, w1_weight, w3_weight, silu), w2_weight)
 
 
 class SwiGLU(nn.Module):
