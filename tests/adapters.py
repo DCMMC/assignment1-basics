@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from cs336_basics.bpe import Tokenizer, train_bpe
-from cs336_basics.nn import Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU
+from cs336_basics.nn import CausalMultiHeadAttention, Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU, TransformerBlock, TransformerLM, scaled_dot_product_attention, silu, softmax
 
 
 def run_linear(
@@ -89,7 +89,7 @@ def run_swiglu(
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
     swiglu = SwiGLU(d_model, d_ff)
-    swiglu.load_state_dict({"w1_weight": w1_weight, "w2_weight": w2_weight, "w3_weight": w3_weight})
+    swiglu.load_state_dict({"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight})
     return swiglu(in_features)
 
 
@@ -111,8 +111,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
-
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 def run_multihead_self_attention(
     d_model: int,
@@ -145,7 +144,11 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    causal_multihead_attention = CausalMultiHeadAttention(d_model, num_heads)
+    causal_multihead_attention.load_state_dict(
+        {"q_proj.weight": q_proj_weight, "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight, "output_proj.weight": o_proj_weight})
+    return causal_multihead_attention(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -185,8 +188,12 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
+    causal_multihead_attention = CausalMultiHeadAttention(d_model, num_heads)
+    causal_multihead_attention.load_state_dict(
+        {"q_proj.weight": q_proj_weight, "k_proj.weight": k_proj_weight,
+        "v_proj.weight": v_proj_weight, "output_proj.weight": o_proj_weight})
+    return causal_multihead_attention(in_features, rope, token_positions)
 
 def run_rope(
     d_k: int,
@@ -280,8 +287,9 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
-
+    transformer_block = TransformerBlock(d_model, num_heads, d_ff, theta, max_seq_len)
+    transformer_block.load_state_dict(weights)
+    return transformer_block(in_features)
 
 def run_transformer_lm(
     vocab_size: int,
@@ -362,7 +370,9 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm = TransformerLM(vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, context_length)
+    transformer_lm.load_state_dict(weights)
+    return transformer_lm(in_indices)
 
 
 def run_rmsnorm(
@@ -401,8 +411,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
-
+    return silu(in_features)
 
 def run_get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
@@ -440,7 +449,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:

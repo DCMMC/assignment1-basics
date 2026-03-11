@@ -98,15 +98,12 @@ class SwiGLU(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
-        self.w1_weight = nn.Parameter(torch.empty((d_ff, d_model), device=device, dtype=dtype))
-        self.w2_weight = nn.Parameter(torch.empty((d_model, d_ff), device=device, dtype=dtype))
-        self.w3_weight = nn.Parameter(torch.empty((d_ff, d_model), device=device, dtype=dtype))
-        linear_weight_init(self.w1_weight)
-        linear_weight_init(self.w2_weight)
-        linear_weight_init(self.w3_weight)
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
 
     def forward(self, x: Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
-        return swiglu(x, self.w1_weight, self.w2_weight, self.w3_weight)
+        return swiglu(x, self.w1.weight, self.w2.weight, self.w3.weight)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -130,7 +127,14 @@ class RotaryPositionalEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         self.device = device
         # [d_k // 2]
-        self.register_buffer("inv_freq", 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device) / d_k)))
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k))
+        # Precompute cos/sin for positions [0, max_seq_len): (max_seq_len, d_k//2) -> (max_seq_len, d_k)
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (max_seq_len, d_k//2)
+        cos_cache = freqs.cos().repeat_interleave(2, dim=-1)   # (max_seq_len, d_k)
+        sin_cache = freqs.sin().repeat_interleave(2, dim=-1)   # (max_seq_len, d_k)
+        self.register_buffer("cos_cache", cos_cache, persistent=False)
+        self.register_buffer("sin_cache", sin_cache, persistent=False)
 
     def rotate_half(self, x: Float[Tensor, " ... seq_len d_k"]) -> Float[Tensor, " ... seq_len d_k"]:
         assert x.shape[-1] == self.d_k
@@ -140,14 +144,135 @@ class RotaryPositionalEmbedding(nn.Module):
         return rotated.reshape(*x.shape[:-1], -1)
 
     def forward(self, x: Float[Tensor, " ... seq_len d_k"],
-        token_positions: Integer[Tensor, " ... seq_len"]
-    ) -> Float[Tensor, " ... seq_len"]:
+        token_positions: Integer[Tensor, " ... seq_len"] | None = None
+    ) -> Float[Tensor, " ... seq_len d_k"]:
         seq_len = x.shape[-2]
         assert x.shape[-1] == self.d_k
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
-        freqs = multiply("... seq_len, d_2 -> ... seq_len d_2", token_positions, self.inv_freq)
-        cos = freqs.cos().repeat_interleave(2, dim=-1)
-        sin = freqs.sin().repeat_interleave(2, dim=-1)
+        # Index precomputed cos/sin by token_positions: (..., seq_len, d_k)
+        if token_positions is None:
+            cos = self.cos_cache[:seq_len]
+            sin = self.sin_cache[:seq_len]
+        else:
+            cos = get_at("[max_seq_len] d_k, ... seq_len -> ... seq_len d_k", self.cos_cache, token_positions)
+            sin = get_at("[max_seq_len] d_k, ... seq_len -> ... seq_len d_k", self.sin_cache, token_positions)
         # x_0 -> x_0 * cos(theta) - x_1 * sin(theta); x_1 -> x_1 * cos(theta) + x_0 * sin(theta)
         return x * cos + self.rotate_half(x) * sin
+
+
+def softmax(x: Float[Tensor, " ... d_model"], dim: int = -1) -> Float[Tensor, " ... d_model"]:
+    m = x.max(dim=dim, keepdim=True).values
+    # NOTE: this is numerically stable
+    e = torch.exp(x - m)
+    s = e.sum(dim=dim, keepdim=True)
+    return e / s
+
+
+def scaled_dot_product_attention(query: Float[Tensor, "batch_size ... seq_len d_k"],
+    key: Float[Tensor, "batch_size ... seq_len d_k"],
+    value: Float[Tensor, "batch_size ... seq_len d_v"],
+    mask: Float[Tensor, "... seq_len seq_len"] | None = None
+) -> Float[Tensor, "batch_size ... seq_len d_v"]:
+    d_k = query.shape[-1]
+    scores = dot("batch_size ... query_len [d_k], batch_size ... key_len [d_k] "
+        "-> batch_size ... query_len key_len", query, key)
+    scores = scores / (d_k ** 0.5)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+    scores = softmax(scores, dim=-1)
+    return dot("batch_size ... query_len [key_len], batch_size ... [key_len] d_v "
+        "-> batch_size ... query_len d_v", scores, value)
+
+
+class CausalMultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(self,
+        x: Float[Tensor, "batch_size seq_len d_model"],
+        rope: RotaryPositionalEmbedding | None = None,
+        token_positions: Integer[Tensor, " ... seq_len"] | None = None,
+    )-> Float[Tensor, "batch_size seq_len d_model"]:
+        mask = torch.logical_not(torch.triu(torch.ones((x.shape[-2], x.shape[-2]), device=x.device,
+            dtype=torch.bool), diagonal=1))
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = q.reshape(*x.shape[:2], self.num_heads, self.d_k)
+        k = k.reshape(*x.shape[:2], self.num_heads, self.d_k)
+        v = v.reshape(*x.shape[:2], self.num_heads, self.d_v)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        if rope is not None:
+            q = rope(q, token_positions)
+            k = rope(k, token_positions)
+        attn = scaled_dot_product_attention(q, k, v, mask)
+        attn = attn.permute(0, 2, 1, 3)
+        attn = attn.reshape(*x.shape[:2], self.d_model)
+        return self.output_proj(attn)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int,
+        theta: float, max_seq_len: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.attn = CausalMultiHeadAttention(d_model, num_heads, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
+
+    def forward(self,
+        x: Float[Tensor, "batch_size seq_len d_model"]
+    )-> Float[Tensor, "batch_size seq_len d_model"]:
+        x = x + self.attn(self.ln1(x), self.rope)
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, num_layers: int, num_heads: int, d_ff: int,
+        theta: float, context_length: int, device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.theta = theta
+        self.layers = nn.ModuleList([TransformerBlock(
+            d_model, num_heads, d_ff, theta, context_length, device=device, dtype=dtype
+        ) for _ in range(num_layers)])
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+
+    def forward(self,
+        x: Integer[Tensor, "batch_size seq_len"],
+    )-> Float[Tensor, "batch_size seq_len vocab_size"]:
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        return self.lm_head(x)
