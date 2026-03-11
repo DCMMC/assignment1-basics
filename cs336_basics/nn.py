@@ -134,10 +134,10 @@ class RotaryPositionalEmbedding(nn.Module):
 
     def rotate_half(self, x: Float[Tensor, " ... seq_len d_k"]) -> Float[Tensor, " ... seq_len d_k"]:
         assert x.shape[-1] == self.d_k
-        x[..., 1::2] *= -1
-        x = torch.cat((x[..., 1::2], x[..., 0::2]), dim=-1)
-        x = x.reshape(-1, self.d_k)
-        return x
+        # Reshape to pairs (x_0, x_1), (x_2, x_3), ... then (-x_1, x_0), (-x_3, x_2), ...
+        x_pairs = x.reshape(*x.shape[:-1], -1, 2)
+        rotated = torch.stack([-x_pairs[..., 1], x_pairs[..., 0]], dim=-1)
+        return rotated.reshape(*x.shape[:-1], -1)
 
     def forward(self, x: Float[Tensor, " ... seq_len d_k"],
         token_positions: Integer[Tensor, " ... seq_len"]
@@ -147,9 +147,7 @@ class RotaryPositionalEmbedding(nn.Module):
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
         freqs = multiply("... seq_len, d_2 -> ... seq_len d_2", token_positions, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-        # x_0 -> x_0 * cos(theta) - x_1 * sin(theta)
-        # x_1 -> x_1 * cos(theta) + x_0 * sin(theta)
+        cos = freqs.cos().repeat_interleave(2, dim=-1)
+        sin = freqs.sin().repeat_interleave(2, dim=-1)
+        # x_0 -> x_0 * cos(theta) - x_1 * sin(theta); x_1 -> x_1 * cos(theta) + x_0 * sin(theta)
         return x * cos + self.rotate_half(x) * sin
