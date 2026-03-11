@@ -130,7 +130,7 @@ class RotaryPositionalEmbedding(nn.Module):
         inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k))
         # Precompute cos/sin for positions [0, max_seq_len): (max_seq_len, d_k//2) -> (max_seq_len, d_k)
         positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-        freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (max_seq_len, d_k//2)
+        freqs = multiply("max_seq_len, dk_2 -> max_seq_len dk_2", positions, inv_freq)
         cos_cache = freqs.cos().repeat_interleave(2, dim=-1)   # (max_seq_len, d_k)
         sin_cache = freqs.sin().repeat_interleave(2, dim=-1)   # (max_seq_len, d_k)
         self.register_buffer("cos_cache", cos_cache, persistent=False)
