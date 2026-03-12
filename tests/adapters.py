@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from cs336_basics.bpe import Tokenizer, train_bpe
-from cs336_basics.nn import AdamW, CausalMultiHeadAttention, Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU, TransformerBlock, TransformerLM, cross_entropy, get_lr_cosine_schedule, gradient_clipping, scaled_dot_product_attention, silu, softmax
+from cs336_basics.nn import AdamW, CausalMultiHeadAttention, Embedding, Linear, RMSNorm, RotaryPositionalEmbedding, SwiGLU, TransformerBlock, TransformerLM, cross_entropy, data_loading, get_lr_cosine_schedule, gradient_clipping, load_checkpoint, save_checkpoint, scaled_dot_product_attention, silu, softmax
 
 
 def run_linear(
@@ -433,7 +433,7 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    return data_loading(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -537,7 +537,7 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -558,7 +558,7 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(

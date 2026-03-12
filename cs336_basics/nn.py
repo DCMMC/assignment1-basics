@@ -1,11 +1,13 @@
 import math
+import os
 from typing import Callable, Iterable, Tuple
+import typing
 from jaxtyping import Float, Integer
 import torch
 from torch import Tensor, nn
-import einx
-from einx import dot, get_at, multiply
-
+import numpy as np
+import numpy.typing as npt
+from einx import dot, get_at, multiply 
 
 def linear_weight_init(weight: torch.Tensor) -> None:
     in_features = weight.shape[1]
@@ -373,3 +375,63 @@ def get_lr_cosine_schedule(
             (1 + math.cos(math.pi * (t - t_w) / (t_c - t_w))) / 2
     else:
         return alpha_min
+
+
+def data_loading(
+    x: npt.NDArray, batch_size: int, context_length: int,
+    device: torch.device | None = None,
+) -> Tuple[Integer[Tensor, "batch_size context_length"], Integer[Tensor, "batch_size context_length"]]:
+    """
+    Sample data in batches of size batch_size and context_length.
+    Args:
+        x: numpy integer array with token IDs.
+        batch_size: The size of the batch.
+        context_length: The length of the context for LLM.
+        device: The device to load the data onto.
+    Returns:
+        The sampled input sequences and the corresponding next-token targets
+            with shape (batch_size, context_length).
+    """
+    n = x.shape[0]
+    output_shape = (batch_size, context_length) 
+    start_indices = np.random.randint(0, n - context_length, (batch_size,))
+    indices = start_indices[:, None] + np.arange(context_length)[None, :]
+    x_batch = torch.from_numpy(x[indices]).to(device).view(output_shape)
+    y_batch = torch.from_numpy(x[indices + 1]).to(device).view(output_shape)
+    return x_batch, y_batch
+
+
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int,
+    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+) -> None:
+    """
+    Save the model and optimizer state to a checkpoint file.
+    Args:
+        model: The model to save.
+        optimizer: The optimizer to save.
+        iteration: The current iteration.
+        out: The output directory.
+    """
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration}
+    torch.save(state, out)
+
+
+def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> int:
+    """
+    Load the model and optimizer state from a checkpoint file.
+    Args:
+        src: The source checkpoint file.
+        model: The model to load.
+        optimizer: The optimizer to load.
+    Returns:
+        The iteration number.
+    """
+    state = torch.load(src)
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    return state["iteration"]
