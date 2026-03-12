@@ -336,24 +336,40 @@ class AdamW(torch.optim.Optimizer):
         return loss
 
 
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float, eps: float = 1e-8
+) -> None:
+    l2_norm = torch.linalg.vector_norm(torch.stack(
+        [p.grad.data for p in parameters if p.grad is not None], dim=0), ord=2)
+    clip_coef = max_l2_norm / (l2_norm + eps)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
     for p in parameters:
         if p.grad is not None:
-            p.grad.data.clamp_(-max_l2_norm, max_l2_norm)
+            p.grad.data *= clip_coef_clamped
 
 
 def get_lr_cosine_schedule(
-    it: int,
-    max_learning_rate: float,
-    min_learning_rate: float,
-    warmup_iters: int,
-    cosine_cycle_iters: int
+    t: int,
+    alpha_max: float,
+    alpha_min: float,
+    t_w: int,
+    t_c: int
 ) -> float:
     """
     Get the learning rate for the given iteration.
+    Args:
+        t: The current iteration.
+        alpha_max: The maximum learning rate.
+        alpha_min: The minimum learning rate.
+        t_w: The warmup period.
+        t_c: The cosine cycle period.
+    Returns:
+        The learning rate for the given iteration.
     """
-    if it < warmup_iters:
-        return max_learning_rate * it / warmup_iters
-    lr = min_learning_rate + (max_learning_rate - min_learning_rate) * \
-        (1 + math.cos(math.pi * (it - warmup_iters) / cosine_cycle_iters)) / 2
-    return lr
+    if t < t_w:
+        return alpha_max * t / t_w
+    elif t < t_c:
+        return alpha_min + (alpha_max - alpha_min) * \
+            (1 + math.cos(math.pi * (t - t_w) / (t_c - t_w))) / 2
+    else:
+        return alpha_min
