@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Tuple
 from jaxtyping import Float, Integer
 import torch
 from torch import Tensor, nn
@@ -297,20 +297,43 @@ def cross_entropy(
     return loss
 
 
-def cross_entropy(
-    input_logits: Float[Tensor, "batch_size vocab_size"],
-    target_ids: Integer[Tensor, "batch_size"]
-) -> Float[Tensor, ""]:
-    """
-    Given a tensor of inputs and targets, compute the average cross-entropy
-    loss across examples.
-    """
-    # Numerically stable: use log_softmax then take negative log prob at targets
-    m = input_logits.max(dim=-1, keepdim=True).values
-    log_probs = input_logits - m - torch.log(torch.exp(input_logits - m).sum(dim=-1, keepdim=True))
-    score = get_at("batch_size [vocab_size], batch_size -> batch_size", log_probs, target_ids)
-    loss = -torch.mean(score)
-    return loss
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float, weight_decay: float,
+        betas: Tuple[float, float] = (0.9, 0.95), eps: float = 1e-8
+    ) -> None:
+        defaults = {
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": weight_decay
+        }
+        super().__init__(params, defaults)
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            betas = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                state = self.state[p]
+                t = state.get("t", 1)
+                m = state.get("m", torch.zeros_like(p))
+                v = state.get("v", torch.zeros_like(p))
+                m = betas[0] * m + (1 - betas[0]) * grad
+                v = betas[1] * v + (1 - betas[1]) * grad ** 2
+                alpha_t = lr * (1 - betas[1] ** t) ** 0.5 / (1 - betas[0] ** t)
+                p.data -= alpha_t * m / (v.sqrt() + eps)
+                # Apply weight decay
+                p.data -= lr * weight_decay * p.data
+                state["t"] = t + 1
+                state["m"] = m
+                state["v"] = v
+        return loss
 
 
 def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
