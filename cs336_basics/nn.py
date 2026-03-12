@@ -1,4 +1,5 @@
-from typing import Callable
+import math
+from typing import Callable, Iterable
 from jaxtyping import Float, Integer
 import torch
 from torch import Tensor, nn
@@ -207,21 +208,16 @@ class CausalMultiHeadAttention(nn.Module):
     )-> Float[Tensor, "batch_size seq_len d_model"]:
         mask = torch.logical_not(torch.triu(torch.ones((x.shape[-2], x.shape[-2]), device=x.device,
             dtype=torch.bool), diagonal=1))
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        q = q.reshape(*x.shape[:2], self.num_heads, self.d_k)
-        k = k.reshape(*x.shape[:2], self.num_heads, self.d_k)
-        v = v.reshape(*x.shape[:2], self.num_heads, self.d_v)
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        input_shape = x.shape[:-1]
+        hidden_shape = (*input_shape, self.num_heads, self.d_k)
+        q = self.q_proj(x).view(*hidden_shape).transpose(1, 2)
+        k = self.k_proj(x).view(*hidden_shape).transpose(1, 2)
+        v = self.v_proj(x).view(*hidden_shape).transpose(1, 2)
         if rope is not None:
             q = rope(q, token_positions)
             k = rope(k, token_positions)
         attn = scaled_dot_product_attention(q, k, v, mask)
-        attn = attn.permute(0, 2, 1, 3)
-        attn = attn.reshape(*x.shape[:2], self.d_model)
+        attn = attn.transpose(1, 2).reshape(*input_shape, self.d_model)
         return self.output_proj(attn)
 
 
@@ -276,3 +272,65 @@ class TransformerLM(nn.Module):
             x = layer(x)
         x = self.ln_final(x)
         return self.lm_head(x)
+
+
+def log_softmax(x: Float[Tensor, " ... d_model"], dim: int = -1) -> Float[Tensor, " ... d_model"]:
+    # Numerically stable: subtract max to avoid overflow
+    m = x.max(dim=dim, keepdim=True).values
+    return x - m - torch.log(torch.exp(x - m).sum(dim=dim, keepdim=True))
+
+
+def cross_entropy(
+    input_logits: Float[Tensor, " ... vocab_size"],
+    target_ids: Integer[Tensor, " ... "]
+) -> Float[Tensor, ""]:
+    """
+    Given a tensor of inputs and targets, compute the average cross-entropy
+    loss across examples.
+
+    References:
+        - https://jaykmody.com/blog/stable-softmax/
+    """
+    log_probs = log_softmax(input_logits, dim=-1)
+    score = get_at("... [vocab_size], ... -> ...", log_probs, target_ids)
+    loss = -torch.mean(score)
+    return loss
+
+
+def cross_entropy(
+    input_logits: Float[Tensor, "batch_size vocab_size"],
+    target_ids: Integer[Tensor, "batch_size"]
+) -> Float[Tensor, ""]:
+    """
+    Given a tensor of inputs and targets, compute the average cross-entropy
+    loss across examples.
+    """
+    # Numerically stable: use log_softmax then take negative log prob at targets
+    m = input_logits.max(dim=-1, keepdim=True).values
+    log_probs = input_logits - m - torch.log(torch.exp(input_logits - m).sum(dim=-1, keepdim=True))
+    score = get_at("batch_size [vocab_size], batch_size -> batch_size", log_probs, target_ids)
+    loss = -torch.mean(score)
+    return loss
+
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    for p in parameters:
+        if p.grad is not None:
+            p.grad.data.clamp_(-max_l2_norm, max_l2_norm)
+
+
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int
+) -> float:
+    """
+    Get the learning rate for the given iteration.
+    """
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    lr = min_learning_rate + (max_learning_rate - min_learning_rate) * \
+        (1 + math.cos(math.pi * (it - warmup_iters) / cosine_cycle_iters)) / 2
+    return lr
