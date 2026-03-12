@@ -257,6 +257,7 @@ class TransformerBlock(nn.Module):
     def forward(self,
         x: Float[Tensor, "batch_size seq_len d_model"]
     )-> Float[Tensor, "batch_size seq_len d_model"]:
+        # pre-norm is applied, different from the original Transformer
         x = x + self.attn(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
         return x
