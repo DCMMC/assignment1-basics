@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 import numpy as np
 import numpy.typing as npt
-from einx import dot, get_at, multiply 
+from einx import dot, get_at, multiply, rearrange
 
 def linear_weight_init(weight: torch.Tensor) -> None:
     in_features = weight.shape[1]
@@ -158,8 +158,8 @@ class RotaryPositionalEmbedding(nn.Module):
             cos = self.cos_cache[:seq_len]
             sin = self.sin_cache[:seq_len]
         else:
-            cos = get_at("[max_seq_len] d_k, ... seq_len -> ... seq_len d_k", self.cos_cache, token_positions)
-            sin = get_at("[max_seq_len] d_k, ... seq_len -> ... seq_len d_k", self.sin_cache, token_positions)
+            cos = get_at("[max_seq_len] d_k, ... -> ... d_k", self.cos_cache, token_positions)
+            sin = get_at("[max_seq_len] d_k, ... -> ... d_k", self.sin_cache, token_positions)
         # x_0 -> x_0 * cos(theta) - x_1 * sin(theta); x_1 -> x_1 * cos(theta) + x_0 * sin(theta)
         return x * cos + self.rotate_half(x) * sin
 
@@ -184,8 +184,8 @@ def scaled_dot_product_attention(query: Float[Tensor, "batch_size ... seq_len d_
     if mask is not None:
         scores = scores.masked_fill(mask == 0, float("-inf"))
     scores = softmax(scores, dim=-1)
-    return dot("batch_size ... query_len [key_len], batch_size ... [key_len] d_v "
-        "-> batch_size ... query_len d_v", scores, value)
+    return dot("... query_len [key_len], ... [key_len] d_v "
+        "-> ... query_len d_v", scores, value)
 
 
 class CausalMultiHeadAttention(nn.Module):
@@ -225,16 +225,16 @@ class CausalMultiHeadAttention(nn.Module):
     )-> Float[Tensor, "batch_size seq_len d_model"]:
         mask = torch.logical_not(torch.triu(torch.ones((x.shape[-2], x.shape[-2]), device=x.device,
             dtype=torch.bool), diagonal=1))
-        input_shape = x.shape[:-1]
-        hidden_shape = (*input_shape, self.num_heads, self.d_k)
-        q = self.q_proj(x).view(*hidden_shape).transpose(1, 2)
-        k = self.k_proj(x).view(*hidden_shape).transpose(1, 2)
-        v = self.v_proj(x).view(*hidden_shape).transpose(1, 2)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q, k, v = (rearrange("... seq_len (heads d) -> ... heads seq_len d",
+            x, heads=self.num_heads) for x in (q, k, v))
         if self.positional_encoder is not None:
             q = self.positional_encoder(q, token_positions)
             k = self.positional_encoder(k, token_positions)
         attn = scaled_dot_product_attention(q, k, v, mask)
-        attn = attn.transpose(1, 2).reshape(*input_shape, self.d_model)
+        attn = rearrange("... heads seq_len d -> ... seq_len (heads d)", attn, heads=self.num_heads)
         return self.output_proj(attn)
 
 
