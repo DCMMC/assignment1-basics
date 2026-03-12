@@ -12,7 +12,7 @@ from einx import dot, get_at, multiply
 def linear_weight_init(weight: torch.Tensor) -> None:
     in_features = weight.shape[1]
     out_features = weight.shape[0]
-    sigma = (2 / (in_features + out_features)) ** 0.5
+    sigma = 2 / math.sqrt(in_features + out_features)
     nn.init.trunc_normal_(weight, mean=0.0,
         std=sigma,
         a=-3.0 * sigma, b=3.0 * sigma)
@@ -57,7 +57,7 @@ class RMSNorm(nn.Module):
         assert x.shape[-1] == self.d_model
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        result = x / ((x.pow(2) + self.eps).mean(dim=-1, keepdim=True) ** 0.5) * self.weight
+        result = x / torch.sqrt((x.pow(2) + self.eps).mean(dim=-1, keepdim=True)) * self.weight
         return result.to(in_dtype)
 
 
@@ -178,9 +178,9 @@ def scaled_dot_product_attention(query: Float[Tensor, "batch_size ... seq_len d_
     mask: Float[Tensor, "... seq_len seq_len"] | None = None
 ) -> Float[Tensor, "batch_size ... seq_len d_v"]:
     d_k = query.shape[-1]
-    scores = dot("batch_size ... query_len [d_k], batch_size ... key_len [d_k] "
-        "-> batch_size ... query_len key_len", query, key)
-    scores = scores / (d_k ** 0.5)
+    scores = dot("... query_len [d_k], ... key_len [d_k] "
+        "-> ... query_len key_len", query, key)
+    scores = scores / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask == 0, float("-inf"))
     scores = softmax(scores, dim=-1)
@@ -189,7 +189,21 @@ def scaled_dot_product_attention(query: Float[Tensor, "batch_size ... seq_len d_
 
 
 class CausalMultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, device: torch.device | None = None,
+    """Causal multi-head attention layer.
+
+    Args:
+        d_model (int): The dimension of the model.
+        num_heads (int): The number of heads.
+        positional_encoder (nn.Module | None, optional): The positional encoder to use. Defaults to None.
+        device (torch.device | None, optional): The device to use. Defaults to None.
+        dtype (torch.dtype | None, optional): The data type to use. Defaults to None.
+
+    Returns:
+        Float[Tensor, "batch_size seq_len d_model"]: The output tensor.
+    """
+    def __init__(self, d_model: int, num_heads: int,
+        positional_encoder: nn.Module | None = None,
+        device: torch.device | None = None,
         dtype: torch.dtype | None = None
     ) -> None:
         super().__init__()
@@ -202,6 +216,7 @@ class CausalMultiHeadAttention(nn.Module):
         self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.positional_encoder = positional_encoder
 
     def forward(self,
         x: Float[Tensor, "batch_size seq_len d_model"],
@@ -215,9 +230,9 @@ class CausalMultiHeadAttention(nn.Module):
         q = self.q_proj(x).view(*hidden_shape).transpose(1, 2)
         k = self.k_proj(x).view(*hidden_shape).transpose(1, 2)
         v = self.v_proj(x).view(*hidden_shape).transpose(1, 2)
-        if rope is not None:
-            q = rope(q, token_positions)
-            k = rope(k, token_positions)
+        if self.positional_encoder is not None:
+            q = self.positional_encoder(q, token_positions)
+            k = self.positional_encoder(k, token_positions)
         attn = scaled_dot_product_attention(q, k, v, mask)
         attn = attn.transpose(1, 2).reshape(*input_shape, self.d_model)
         return self.output_proj(attn)
@@ -233,16 +248,16 @@ class TransformerBlock(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
-        self.attn = CausalMultiHeadAttention(d_model, num_heads, device=device, dtype=dtype)
+        self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
+        self.attn = CausalMultiHeadAttention(d_model, num_heads, self.rope, device=device, dtype=dtype)
         self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
-        self.rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
 
     def forward(self,
         x: Float[Tensor, "batch_size seq_len d_model"]
     )-> Float[Tensor, "batch_size seq_len d_model"]:
-        x = x + self.attn(self.ln1(x), self.rope)
+        x = x + self.attn(self.ln1(x))
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -328,7 +343,7 @@ class AdamW(torch.optim.Optimizer):
                 v = state.get("v", torch.zeros_like(p))
                 m = betas[0] * m + (1 - betas[0]) * grad
                 v = betas[1] * v + (1 - betas[1]) * grad ** 2
-                alpha_t = lr * (1 - betas[1] ** t) ** 0.5 / (1 - betas[0] ** t)
+                alpha_t = lr * math.sqrt(1 - betas[1] ** t) / (1 - betas[0] ** t)
                 p.data -= alpha_t * m / (v.sqrt() + eps)
                 # Apply weight decay
                 p.data -= lr * weight_decay * p.data

@@ -189,11 +189,11 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
     rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
-    causal_multihead_attention = CausalMultiHeadAttention(d_model, num_heads)
+    causal_multihead_attention = CausalMultiHeadAttention(d_model, num_heads, rope)
     causal_multihead_attention.load_state_dict(
         {"q_proj.weight": q_proj_weight, "k_proj.weight": k_proj_weight,
         "v_proj.weight": v_proj_weight, "output_proj.weight": o_proj_weight})
-    return causal_multihead_attention(in_features, rope, token_positions)
+    return causal_multihead_attention(in_features, token_positions)
 
 def run_rope(
     d_k: int,
