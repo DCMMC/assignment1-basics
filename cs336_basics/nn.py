@@ -289,7 +289,52 @@ class TransformerLM(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.ln_final(x)
-        return self.lm_head(x)
+        return self.lm_head(x) 
+
+    @torch.no_grad()
+    def generate(self,
+        x: Integer[Tensor, "seq_len"] | Integer[Tensor, "batch_size seq_len"],
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        filter_value: float = -float("inf"),
+        eos_token: int | None = None,
+    ) -> Integer[Tensor, "batch_size seq_len vocab_size"]:
+        if x.dim() == 1:
+            x = x[None, :]
+        assert x.dim() == 2, "x must be a 2D tensor"
+        input_len = x.shape[1]
+        for _ in range(max_new_tokens):
+            x = x[:, -self.context_length:] if x.shape[1] > self.context_length else x
+            logits = self.forward(x)
+            top_cnt = min(top_k, logits.shape[-1])
+            # -> [batch_size, vocab_size]
+            next_token_logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_cnt, dim=1)[0][:, -1, None]
+                next_token_logits[indices_to_remove] = filter_value
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, dim=-1, descending=True)
+                cumulative_probs = torch.cumsum(softmax(sorted_logits, dim=-1), dim=-1)
+                # the smallest set of indices such that the cumulative sum of the
+                # probabilities is greater than top_p
+                indices_to_remove = cumulative_probs > top_p
+                # keep the first index always included, and right shift the rest mask
+                # -> [batch_size, vocab_size]
+                indices_to_remove = torch.cat([
+                    torch.zeros(next_token_logits.shape[0], 1), indices_to_remove[..., 1:]])
+                sorted_indices[indices_to_remove] = filter_value
+                next_token_logits = sorted_logits.gather(-1, sorted_indices, sorted_indices.argsort(dim=-1))
+            next_token_probs = softmax(next_token_logits, dim=-1)
+            # -> [batch_size, 1]
+            next_token = torch.multinomial(next_token_probs, num_samples=1)
+            if eos_token is not None and next_token == eos_token:
+                # hit end_of_sequence token
+                break
+            x = torch.cat([x, next_token], dim=-1)
+        generated_tokens = x[:, input_len:]
+        return generated_tokens
 
 
 def log_softmax(x: Float[Tensor, " ... d_model"], dim: int = -1) -> Float[Tensor, " ... d_model"]:
