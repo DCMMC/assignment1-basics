@@ -403,13 +403,14 @@ class AdamW(torch.optim.Optimizer):
 def gradient_clipping(parameters: Iterable[torch.nn.Parameter],
     max_l2_norm: float, eps: float = 1e-8
 ) -> None:
-    l2_norm = torch.linalg.vector_norm(torch.stack(
-        [p.grad.data for p in parameters if p.grad is not None], dim=0), ord=2)
-    clip_coef = max_l2_norm / (l2_norm + eps)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    for p in parameters:
-        if p.grad is not None:
-            p.grad.data *= clip_coef_clamped
+    norm = 0.0
+    grads = [p.grad for p in parameters if p.grad is not None]
+    for g in grads:
+        norm += g.square().sum()
+    norm = torch.sqrt(norm)
+    clip_coef = min(1.0, max_l2_norm / (norm + eps))
+    for g in grads:
+        g *= clip_coef
 
 
 def get_lr_cosine_schedule(
