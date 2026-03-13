@@ -56,6 +56,7 @@ class RMSNorm(nn.Module):
     def forward(self, x: Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
         assert x.shape[-1] == self.d_model
         in_dtype = x.dtype
+        # manually upcast the input to fp32 here to prevent overflow in sqrt
         x = x.to(torch.float32)
         result = x / torch.sqrt((x.pow(2) + self.eps).mean(dim=-1, keepdim=True)) * self.weight
         return result.to(in_dtype)
