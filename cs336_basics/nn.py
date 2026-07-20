@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 import numpy as np
 import numpy.typing as npt
-from einx import dot, get_at, multiply, rearrange
+from einx import dot, get_at, id as rearrange, multiply
 
 def linear_weight_init(weight: torch.Tensor) -> None:
     in_features = weight.shape[1]
